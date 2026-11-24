@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Vein Labeling</title>
+<style>
+  :root { --bg:#14171a; --panel:#1f2428; --line:#343b42; --text:#eef1f3; --muted:#a4adb5; --accent:#00e5ff; --arm:#ffc53d; --warn:#ff9b6b; }
+  * { box-sizing:border-box; }
+  html,body { height:100%; margin:0; background:var(--bg); color:var(--text); font:14px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif; }
+  body { display:flex; flex-direction:column; }
+  header { display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:8px 12px; background:var(--panel); border-bottom:1px solid var(--line); }
+  #where { font-weight:600; margin-right:auto; font-variant-numeric:tabular-nums; }
+  #where small { display:block; font-weight:400; color:var(--muted); }
+  button { min-height:34px; padding:0 11px; color:var(--text); background:transparent; border:1px solid var(--line); border-radius:6px; font:inherit; cursor:pointer; }
+  button:hover { border-color:var(--muted); }
+  button.on { border-color:var(--accent); color:var(--accent); }
+  button.on.arm { border-color:var(--arm); color:var(--arm); }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#04181c; font-weight:600; }
+  .group { display:flex; gap:4px; align-items:center; }
+  kbd { font:11px ui-monospace,monospace; color:var(--muted); margin-left:4px; }
+  #stage { flex:1; overflow:auto; min-height:0; }
+  #sheet { position:relative; margin:auto; line-height:0; }
+  #sheet img, #sheet canvas { position:absolute; inset:0; width:100%; height:100%; display:block; user-select:none; -webkit-user-drag:none; }
+  #veins { opacity:.6; pointer-events:none; }
+  #overlay { cursor:crosshair; touch-action:none; }
+  footer { display:flex; flex-wrap:wrap; gap:4px 16px; padding:6px 12px; background:var(--panel); border-top:1px solid var(--line); color:var(--muted); font-size:13px; }
+  #status { color:var(--warn); font-weight:600; }
+  #status.ok { color:var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <div id="where">Loading…<small></small></div>
+  <div class="group">
+    <button id="modeArm" class="arm">Outline arm<kbd>A</kbd></button>
+    <button id="modeVein">Paint veins<kbd>V</kbd></button>
+  </div>
+  <div class="group">
+    <button id="view">View: raw<kbd>E</kbd></button>
+    <button id="hide">Hide veins<kbd>H</kbd></button>
+  </div>
+  <div class="group">
+    <button id="smaller" aria-label="Smaller brush">−</button>
+    <span id="brush"></span>
+    <button id="bigger" aria-label="Bigger brush">+</button>
+    <button id="zoomOut" aria-label="Zoom out">Zoom −</button>
+    <button id="zoomIn" aria-label="Zoom in">Zoom +</button>
+  </div>
+  <div class="group">
+    <button id="undo">Undo<kbd>Z</kbd></button>
+    <button id="noVeins">No visible veins<kbd>N</kbd></button>
+  </div>
+  <div class="group">
+    <button id="prev">Back<kbd>←</kbd></button>
+    <button id="next" class="primary">Save &amp; next<kbd style="color:inherit">Enter</kbd></button>
+  </div>
+</header>
+<main id="stage">
+  <div id="sheet">
+    <img id="img" alt="Infrared frame to label" draggable="false" />
+    <canvas id="veins"></canvas>
+    <canvas id="overlay"></canvas>
+  </div>
+</main>
+<footer>
+  <span id="status"></span>
+  <span id="hint"></span>
+</footer>
+<script>
+const $ = (id) => document.getElementById(id);
+const img = $("img"), veins = $("veins"), overlay = $("overlay"), sheet = $("sheet"), stage = $("stage");
+const vctx = veins.getContext("2d", { willReadFrequently: true }), octx = overlay.getContext("2d");
+const VEIN = "rgb(0,229,255)", ARM = "#ffc53d", MAX_UNDO = 8;
+
+let items = [], index = 0, mode = "arm", view = "raw", arm = [], noVeins = false, dirty = false;
+let brush = 10, zoom = 1, painting = null, pointer = null, undoStack = [], hidden = false, saving = Promise.resolve();
+
+function setStatus(text, ok) { const s = $("status"); s.textContent = text; s.classList.toggle("ok", !!ok); }
+function item() { return items[index]; }
+
+function fit() {
+  const it = item();
+  if (!it) return;
+  const scale = Math.min(stage.clientWidth / it.width, stage.clientHeight / it.height) * zoom;
+  sheet.style.width = `${Math.round(it.width * scale)}px`;
+  sheet.style.height = `${Math.round(it.height * scale)}px`;
+}
+
+function refreshControls() {
+  const it = item();
+  const done = items.filter((x) => x.done).length;
+  $("where").firstChild.textContent = `Frame ${index + 1} of ${items.length} · ${done} labeled`;
+  $("where").querySelector("small").textContent = `${it.person} · ${it.site} · ${it.light} · labeler ${document.body.dataset.labeler}${it.done ? " · saved" : ""}`;
+  $("modeArm").classList.toggle("on", mode === "arm");
+  $("modeVein").classList.toggle("on", mode === "veins");
+  $("view").firstChild.textContent = `View: ${view}`;
+  $("hide").firstChild.textContent = hidden ? "Show veins" : "Hide veins";
+  $("noVeins").classList.toggle("on", noVeins);
+  $("brush").textContent = `Brush ${brush}px`;
+  veins.style.visibility = hidden ? "hidden" : "visible";
+  $("hint").textContent = mode === "arm"
+    ? "Click around the arm's edge. Rough is fine: 6 to 12 points. Z removes the last point."
+    : "Paint along each vein you're confident about. Shift-drag or right-drag erases. Press E to compare views.";
+}
+
+function hasPaint() {
+  const d = vctx.getImageData(0, 0, veins.width, veins.height).data;
+  for (let i = 3; i < d.length; i += 4) if (d[i] > 127) return true;
+  return false;
+}
+
+function missing() {
+  if (arm.length < 3) return "Outline the arm first";
+  if (!noVeins && !hasPaint()) return "Paint the veins, or press N if none are visible";
+  return "";
+}
+
+function redraw() {
+  octx.clearRect(0, 0, overlay.width, overlay.height);
+  const scale = overlay.width / overlay.getBoundingClientRect().width || 1;
+  if (arm.length) {
+    octx.beginPath();
+    arm.forEach(([x, y], i) => (i ? octx.lineTo(x, y) : octx.moveTo(x, y)));
+    if (arm.length > 2) { octx.closePath(); octx.fillStyle = "rgba(255,197,61,.08)"; octx.fill(); }
+    octx.strokeStyle = ARM;
+    octx.lineWidth = 2 * scale;
+    octx.stroke();
+    octx.fillStyle = ARM;
+    arm.forEach(([x, y]) => { octx.beginPath(); octx.arc(x, y, 4 * scale, 0, 7); octx.fill(); });
+  }
+  if (mode === "veins" && pointer) {
+    octx.beginPath();
+    octx.arc(pointer[0], pointer[1], brush / 2, 0, 7);
+    octx.strokeStyle = "#fff";
+    octx.lineWidth = 1 * scale;
+    octx.stroke();
+  }
+}
+
+function pushUndo(entry) {
+  undoStack.push(entry);
+  if (undoStack.length > MAX_UNDO) undoStack.shift();
+}
+
+function undo() {
+  const entry = undoStack.pop();
+  if (!entry) return;
+  if (entry.kind === "arm") arm.pop();
+  else vctx.putImageData(entry.image, 0, 0);
+  dirty = true;
+  redraw();
+}
+
+function position(e) {
+  const r = overlay.getBoundingClientRect();
+  return [(e.clientX - r.left) * overlay.width / r.width, (e.clientY - r.top) * overlay.height / r.height];
+}
+
+function stroke(from, to, erase) {
+  vctx.globalCompositeOperation = erase ? "destination-out" : "source-over";
+  vctx.strokeStyle = VEIN;
+  vctx.lineWidth = brush;
+  vctx.lineCap = vctx.lineJoin = "round";
+  vctx.beginPath();
+  vctx.moveTo(from[0], from[1]);
+  vctx.lineTo(to[0], to[1]);
+  vctx.stroke();
+  vctx.globalCompositeOperation = "source-over";
+}
+
+overlay.addEventListener("contextmenu", (e) => e.preventDefault());
+overlay.addEventListener("pointerdown", (e) => {
+  overlay.setPointerCapture(e.pointerId);
+  const p = position(e);
+  if (mode === "arm") {
+    if (e.button === 0) { arm.push(p); pushUndo({ kind: "arm" }); dirty = true; redraw(); }
+    return;
+  }
+  pushUndo({ kind: "veins", image: vctx.getImageData(0, 0, veins.width, veins.height) });
+  painting = { last: p, erase: e.shiftKey || e.button === 2 };
+  stroke(p, p, painting.erase);
+  dirty = true;
+  if (!painting.erase && noVeins) { noVeins = false; refreshControls(); }
+});
+overlay.addEventListener("pointermove", (e) => {
+  pointer = position(e);
+  if (painting) { stroke(painting.last, pointer, painting.erase); painting.last = pointer; }
+  redraw();
+});
+const endPaint = () => { painting = null; };
+overlay.addEventListener("pointerup", endPaint);
+overlay.addEventListener("pointercancel", endPaint);
+overlay.addEventListener("pointerleave", () => { pointer = null; redraw(); });
+
+function save() {
+  const it = item();
+  if (!dirty || !it) return saving;
+  dirty = false;
+  const body = JSON.stringify({ arm, no_veins: noVeins, veins_png: veins.toDataURL("image/png") });
+  saving = saving.then(() => fetch(`/api/label/${it.stem}`, { method: "POST", headers: { "Content-Type": "application/json" }, body }))
+    .then(async (r) => {
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      it.done = (await r.json()).done;
+      refreshControls();
+    })
+    .catch((err) => { dirty = true; setStatus(`Couldn't save (${err.message}). Is the labeling tool still running?`); });
+  return saving;
+}
+
+async function load(i) {
+  await save();
+  index = Math.max(0, Math.min(items.length - 1, i));
+  const it = item();
+  arm = []; noVeins = false; undoStack = []; dirty = false;
+  for (const c of [veins, overlay]) { c.width = it.width; c.height = it.height; }
+  fit();
+  img.src = `/image/${it.stem}/${view}`;
+  const meta = await (await fetch(`/api/label/${it.stem}`)).json();
+  if (item() !== it) return;
+  arm = meta.arm || [];
+  noVeins = !!meta.no_veins;
+  if (meta.has_veins) {
+    const mask = new Image();
+    mask.onload = () => { if (item() === it) vctx.drawImage(mask, 0, 0); };
+    mask.src = `/api/label/${it.stem}/veins.png?t=${Date.now()}`;
+  }
+  mode = arm.length >= 3 ? "veins" : "arm";
+  setStatus("");
+  refreshControls();
+  redraw();
+}
+
+function next() {
+  const problem = missing();
+  if (problem) { setStatus(problem); return; }
+  if (index === items.length - 1) {
+    save().then(() => setStatus(`All ${items.length} frames visited. Next: ./run.sh evaluate`, true));
+    return;
+  }
+  load(index + 1);
+}
+
+function setView(v) { view = v; img.src = `/image/${item().stem}/${view}`; refreshControls(); }
+function setMode(m) { mode = m; refreshControls(); redraw(); }
+function setBrush(b) { brush = Math.max(2, Math.min(60, b)); refreshControls(); redraw(); }
+function setZoom(z) { zoom = Math.max(1, Math.min(6, z)); fit(); }
+function toggleNoVeins() {
+  noVeins = !noVeins; dirty = true; setStatus(""); refreshControls();
+}
+
+$("modeArm").onclick = () => setMode("arm");
+$("modeVein").onclick = () => setMode("veins");
+$("view").onclick = () => setView(view === "raw" ? "enhanced" : "raw");
+$("hide").onclick = () => { hidden = !hidden; refreshControls(); };
+$("smaller").onclick = () => setBrush(brush - 2);
+$("bigger").onclick = () => setBrush(brush + 2);
+$("zoomIn").onclick = () => setZoom(zoom * 1.4);
+$("zoomOut").onclick = () => setZoom(zoom / 1.4);
+$("undo").onclick = undo;
+$("noVeins").onclick = toggleNoVeins;
+$("prev").onclick = () => load(index - 1);
+$("next").onclick = next;
+window.addEventListener("resize", fit);
+window.addEventListener("beforeunload", (e) => { if (dirty) { save(); e.preventDefault(); } });
+window.addEventListener("keydown", (e) => {
+  if (e.metaKey || e.ctrlKey) return;
+  const key = e.key.toLowerCase();
+  const actions = {
+    a: () => setMode("arm"), v: () => setMode("veins"), e: () => setView(view === "raw" ? "enhanced" : "raw"),
+    h: $("hide").onclick, z: undo, n: toggleNoVeins, enter: next, arrowleft: () => load(index - 1),
+    arrowright: () => load(index + 1), "[": () => setBrush(brush - 2), "]": () => setBrush(brush + 2),
+    "+": $("zoomIn").onclick, "=": $("zoomIn").onclick, "-": $("zoomOut").onclick,
+  };
+  if (actions[key]) { e.preventDefault(); actions[key](); }
+});
+
+(async () => {
+  const q = await (await fetch("/api/queue")).json();
+  items = q.items;
+  document.body.dataset.labeler = q.labeler;
+  if (!items.length) { setStatus("No frames to label yet."); return; }
+  const first = items.findIndex((x) => !x.done);
+  await load(first === -1 ? 0 : first);
+})();
+</script>
+</body>
+</html>
