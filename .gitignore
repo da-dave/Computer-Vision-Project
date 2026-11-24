@@ -1,0 +1,21 @@
+# secrets and local-only files
+.env
+.venv/
+__pycache__/
+.claude/
+.DS_Store
+
+# vein-camera-stream: downloaded models, saved photos, recordings
+*.task
+captures/
+*.mp4
+
+# vein-evaluation: images of people's arms stay off GitHub, and results are generated from them
+vein-evaluation/dataset/
+vein-evaluation/results/
+
+# self-signed HTTPS certificate and private key (made on each computer)
+certs/
+
+# downloaded speech voice
+voices/
